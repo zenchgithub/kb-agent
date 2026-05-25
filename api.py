@@ -20,6 +20,7 @@ import requests
 from ingest import ingest
 from ingest_remote_dir import BASE_URL, ingest_remote_dir
 from config import cors_origins
+from document_links import document_name, document_url
 
 # Data validation for request bodies
 from pydantic import BaseModel
@@ -165,9 +166,6 @@ def find_document_file(raw_source: str) -> Path | None:
             return candidate
     return None
 
-def document_url(raw_source: str) -> str:
-    return f"/documents?source={quote(raw_source, safe='')}"
-
 def format_file_size(size: int | None) -> str:
     if size is None:
         return "Unknown"
@@ -216,10 +214,10 @@ def indexed_documents(
             if not raw_source:
                 continue
 
-            document_name = unquote(Path(raw_source).name).strip()
+            clean_document_name = document_name(raw_source)
             entry = docs.setdefault(raw_source, {
                 "id": raw_source,
-                "name": document_name,
+                "name": clean_document_name,
                 "collection": collection,
                 "pages": set(),
                 "chunks": 0,
@@ -305,7 +303,7 @@ async def upload_document(
         "status": "ok",
         "document_name": filename,
         "collection": x_collection,
-        "source": document_url(str(local_path.relative_to(Path(__file__).resolve().parent))),
+        "source": document_url(filename),
         "nas_url": nas_url,
     }
 

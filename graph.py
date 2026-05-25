@@ -5,6 +5,7 @@ from urllib.parse import quote, unquote
 from dotenv import load_dotenv
 from qdrant_client import models
 from config import get_qdrant_client
+from document_links import document_name, document_url
 
 class State(TypedDict, total=False):
     question: str            # original user question
@@ -357,12 +358,12 @@ def normalize(state: State) -> State:
     sources = []
     for i, c in enumerate(state["ranked"], 1):
         raw_source = str(c["source"])
-        document_name = unquote(Path(raw_source).name).strip()
-        source_url = f"/documents?source={quote(raw_source, safe='')}"
-        parts.append(f"[{i}] ({document_name} p.{c['page']}) {c['text']}")
+        clean_document_name = document_name(raw_source)
+        source_url = document_url(raw_source)
+        parts.append(f"[{i}] ({clean_document_name} p.{c['page']}) {c['text']}")
         sources.append({
             "id": i,
-            "document_name": document_name,
+            "document_name": clean_document_name,
             "source": source_url,
             "original_source": raw_source,
             "page": c["page"],
