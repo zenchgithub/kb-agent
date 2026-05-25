@@ -176,7 +176,7 @@ def format_file_size(size: int | None) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 @app.get("/documents")
-def open_document(source: str):
+def open_document(source: str, current_user: dict = Depends(get_current_user)):
     raw_source = source
     candidate = find_document_file(raw_source)
     if candidate:
@@ -187,6 +187,29 @@ def open_document(source: str):
                 "Content-Disposition": (
                     f'inline; filename="{unquote(candidate.name).strip()}"'
                 )
+            },
+        )
+
+    filename = document_name(raw_source)
+    if filename:
+        nas_url = f"{BASE_URL.rstrip('/')}/{quote(filename)}"
+        auth = (WEBDAV_USER, WEBDAV_PASS) if WEBDAV_USER else None
+        try:
+            resp = requests.get(nas_url, auth=auth, timeout=60)
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail="Document not found")
+            resp.raise_for_status()
+        except HTTPException:
+            raise
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"NAS document fetch failed: {exc}") from exc
+
+        return Response(
+            content=resp.content,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Cache-Control": "private, max-age=300",
             },
         )
 
