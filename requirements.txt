@@ -1,0 +1,15 @@
+beautifulsoup4
+fastapi
+httpx
+langgraph
+openai
+psycopg2-binary
+pydantic
+python-jose[cryptography]
+qdrant-client
+python-dotenv
+pypdf
+pyyaml
+requests
+sqlalchemy
+uvicorn[standard]

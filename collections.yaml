@@ -1,0 +1,11 @@
+collections:
+  - name: personal_docs
+    description: "Lease, recorded property document, and I-485 form PDFs."
+    files:
+      - data/pdfs/Lease15505.pdf
+      - data/pdfs/1049-Recored-2022.pdf
+      - data/pdfs/ I-485.pdf
+  - name: nas_docs
+    description: Documents ingested from my UGREEN NAS kb-agent share (lease, 1040 record, I-485, etc.)
+    files: []    
+
