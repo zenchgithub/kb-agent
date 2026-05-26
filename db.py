@@ -65,6 +65,57 @@ def create_conversation(db, user_id: str) -> str:
     return conv_id
 
 
+def user_owns_conversation(db, conversation_id: str, user_id: str) -> bool:
+    result = db.execute(
+        text(
+            "select 1 from conversations "
+            "where id = :cid and user_id = :user_id "
+            "limit 1"
+        ),
+        {"cid": conversation_id, "user_id": user_id},
+    )
+    return result.fetchone() is not None
+
+
+def list_conversations(db, user_id: str):
+    """
+    Return conversation summaries for a user, newest activity first.
+    The title is derived from the first user message when possible.
+    """
+    result = db.execute(
+        text(
+            """
+            select
+              c.id,
+              c.created_at,
+              coalesce(max(m.created_at), c.created_at) as last_message_at,
+              (
+                select m2.content
+                from messages m2
+                where m2.conversation_id = c.id and m2.role = 'user'
+                order by m2.created_at asc
+                limit 1
+              ) as first_user_message
+            from conversations c
+            left join messages m on m.conversation_id = c.id
+            where c.user_id = :user_id
+            group by c.id, c.created_at
+            order by coalesce(max(m.created_at), c.created_at) desc
+            """
+        ),
+        {"user_id": user_id},
+    )
+    return [
+        {
+            "id": str(row[0]),
+            "created_at": row[1].isoformat() if row[1] else None,
+            "updated_at": row[2].isoformat() if row[2] else None,
+            "title": (row[3] or "New conversation")[:60],
+        }
+        for row in result.fetchall()
+    ]
+
+
 def load_messages(db, conversation_id: str):
     """
     Load all messages for a conversation ordered by time.
@@ -94,6 +145,35 @@ def load_messages(db, conversation_id: str):
         {"role": row[0], "content": row[1]}
         for row in rows
     ]
+
+
+def load_messages_for_user(db, conversation_id: str, user_id: str):
+    if not user_owns_conversation(db, conversation_id, user_id):
+        return None
+
+    result = db.execute(
+        text(
+            "select role, content, created_at "
+            "from messages "
+            "where conversation_id = :cid "
+            "order by created_at asc"
+        ),
+        {"cid": conversation_id},
+    )
+    return [
+        {
+            "role": row[0],
+            "content": row[1],
+            "created_at": row[2].isoformat() if row[2] else None,
+        }
+        for row in result.fetchall()
+    ]
+
+
+def load_messages_owned(db, conversation_id: str, user_id: str):
+    if not user_owns_conversation(db, conversation_id, user_id):
+        return None
+    return load_messages(db, conversation_id)
 
 
 def save_message(db, conversation_id: str, role: str, content: str):

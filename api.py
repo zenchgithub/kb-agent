@@ -34,7 +34,15 @@ from graph import agent, qc
 
 # Supabase auth + Neon DB helpers
 from auth import get_current_user  # verifies Supabase JWT, returns {"id": user_id, ...}
-from db import get_db, create_conversation, load_messages, save_message
+from db import (
+    get_db,
+    create_conversation,
+    list_conversations,
+    load_messages,
+    load_messages_for_user,
+    load_messages_owned,
+    save_message,
+)
 
 # Load .env for OPENAI_API_KEY and Supabase / Neon settings
 load_dotenv()
@@ -283,6 +291,27 @@ def current_user_profile(current_user: dict = Depends(get_current_user)):
         "is_admin": is_admin,
     }
 
+
+@app.get("/conversations")
+def conversation_history(
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    return {"conversations": list_conversations(db, current_user["id"])}
+
+
+@app.get("/conversations/{conversation_id}/messages")
+def conversation_messages(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    messages = load_messages_for_user(db, conversation_id, current_user["id"])
+    if messages is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"conversation_id": conversation_id, "messages": messages}
+
+
 @app.post("/upload-document")
 async def upload_document(
     request: Request,
@@ -453,7 +482,8 @@ def query(
         conversation_id = create_conversation(db, user_id)
     else:
         conversation_id = body.conversation_id
-        # Optional: verify this conversation belongs to user_id with a SELECT
+        if load_messages_owned(db, conversation_id, user_id) is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
 
     # 3) Load history for this conversation from Neon
     history = load_messages(db, conversation_id)
@@ -495,6 +525,8 @@ def query_stream(
         conversation_id = create_conversation(db, user_id)
     else:
         conversation_id = body.conversation_id
+        if load_messages_owned(db, conversation_id, user_id) is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
 
     # 3) Load history for this conversation
     history = load_messages(db, conversation_id)
