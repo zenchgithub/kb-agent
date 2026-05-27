@@ -2,13 +2,14 @@ from pathlib import Path
 from typing import TypedDict, List, Dict
 from urllib.parse import quote, unquote
 
-from dotenv import load_dotenv
 from qdrant_client import models
 from config import get_qdrant_client
 from document_links import document_name, document_url
+from env_loader import load_app_env
 
 class State(TypedDict, total=False):
     question: str            # original user question
+    user_id: str             # Supabase auth.users.id from the verified JWT
     history: List[Dict]      # [{"role": "user"|"assistant", "content": "..."}] from the conversation so far
     subqueries: List[str]    # from planning stage
     collections: List[str]   # from planning stage
@@ -20,7 +21,7 @@ class State(TypedDict, total=False):
     
 import json, yaml
 from openai import OpenAI
-load_dotenv() 
+load_app_env()
 oai = OpenAI()
 
 with open("collections.yaml") as f:
@@ -55,9 +56,49 @@ Respond in JSON:
     new_state["collections"] = plan_data["collections"]
     return new_state
 
+def require_user_id(state: State) -> str:
+    user_id = str(state.get("user_id") or "").strip()
+    if not user_id:
+        raise PermissionError("access node: user_id missing from state")
+    return user_id
+
+def user_payload_filter(user_id: str, raw_source: str | None = None) -> models.Filter:
+    must = [
+        models.Filter(
+            should=[
+                models.FieldCondition(
+                    key="user_id",
+                    match=models.MatchValue(value=user_id),
+                ),
+                models.FieldCondition(
+                    key="isPublic",
+                    match=models.MatchValue(value=True),
+                ),
+            ]
+        )
+    ]
+    if raw_source:
+        must.append(
+            models.FieldCondition(
+                key="source",
+                match=models.MatchValue(value=raw_source),
+            )
+        )
+    return models.Filter(must=must)
+
+def assert_owned_candidates(candidates: list[dict], user_id: str):
+    for candidate in candidates:
+        if candidate.get("isPublic") is True:
+            continue
+        candidate_user_id = candidate.get("user_id")
+        if candidate_user_id is not None and str(candidate_user_id) != user_id:
+            raise PermissionError("cross-tenant hit detected")
+
 def access(state: State) -> State:
-    # In a real system, this would filter collections by user/tenant/role.
-    # For your personal agent, we just keep whatever the planner chose.
+    user_id = require_user_id(state)
+    assert_owned_candidates(state.get("candidates", []), user_id)
+    assert_owned_candidates(state.get("ranked", []), user_id)
+
     allowed = {c["name"] for c in COLLECTIONS}
     filtered = [c for c in state.get("collections", []) if c in allowed]
     if not filtered:
@@ -65,7 +106,7 @@ def access(state: State) -> State:
         filtered = list(allowed)
     new_state: State = dict(state)
     new_state["collections"] = filtered
-    print(f"[access] collections={filtered}")
+    print(f"[access] user_id={user_id} collections={filtered}")
     return new_state
 
 import asyncio
@@ -87,12 +128,13 @@ def normalize_search_text(value: str) -> str:
 def source_label(raw_source: str) -> str:
     return unquote(Path(str(raw_source)).name).strip()
 
-def collection_sources(collection: str) -> list[str]:
+def collection_sources(collection: str, user_id: str) -> list[str]:
     sources = set()
     next_offset = None
     while True:
         points, next_offset = qc.scroll(
             collection_name=collection,
+            scroll_filter=user_payload_filter(user_id),
             limit=256,
             offset=next_offset,
             with_payload=["source"],
@@ -106,12 +148,12 @@ def collection_sources(collection: str) -> list[str]:
             break
     return sorted(sources, key=source_label)
 
-def mentioned_sources(question: str, collections: list[str]) -> dict[str, list[str]]:
+def mentioned_sources(question: str, collections: list[str], user_id: str) -> dict[str, list[str]]:
     haystack = normalize_search_text(question)
     matches: dict[str, list[str]] = {}
 
     for collection in collections:
-        for raw_source in collection_sources(collection):
+        for raw_source in collection_sources(collection, user_id):
             name = source_label(raw_source)
             stem = Path(name).stem
             candidates = {
@@ -141,6 +183,7 @@ def keyword_match_chunks(
     collections: list[str],
     question: str,
     source_matches: dict[str, list[str]],
+    user_id: str,
 ) -> list[dict]:
     terms = significant_terms(question)
     if not terms:
@@ -153,6 +196,7 @@ def keyword_match_chunks(
         while True:
             points, next_offset = qc.scroll(
                 collection_name=collection,
+                scroll_filter=user_payload_filter(user_id),
                 limit=256,
                 offset=next_offset,
                 with_payload=True,
@@ -176,6 +220,8 @@ def keyword_match_chunks(
                             "hash",
                             f"{raw_source}:{payload.get('page')}:{payload.get('chunk_index')}",
                         ),
+                        "user_id": payload.get("user_id"),
+                        "isPublic": payload.get("isPublic") is True,
                     })
                     if len(matches) >= KEYWORD_TOPK:
                         return matches
@@ -185,23 +231,14 @@ def keyword_match_chunks(
 
     return matches
 
-async def one_search(query: str, collection: str, raw_source: str | None = None):
+async def one_search(query: str, collection: str, user_id: str, raw_source: str | None = None):
     # embed the query
     vec = oai.embeddings.create(
         model="text-embedding-3-small",
         input=query,
     ).data[0].embedding
 
-    query_filter = None
-    if raw_source:
-        query_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="source",
-                    match=models.MatchValue(value=raw_source),
-                )
-            ]
-        )
+    query_filter = user_payload_filter(user_id, raw_source)
 
     # vector search in Qdrant
     hits = qc.query_points(
@@ -213,27 +250,20 @@ async def one_search(query: str, collection: str, raw_source: str | None = None)
 
     return hits
 
-async def retrieve_all(queries, collections, source_matches):
+async def retrieve_all(queries, collections, source_matches, user_id):
     tasks = []
     for collection in collections:
         matched = source_matches.get(collection) or []
         if matched:
-            tasks.extend(one_search(q, collection, s) for q in queries for s in matched)
+            tasks.extend(one_search(q, collection, user_id, s) for q in queries for s in matched)
         else:
-            tasks.extend(one_search(q, collection) for q in queries)
+            tasks.extend(one_search(q, collection, user_id) for q in queries)
     return await asyncio.gather(*tasks)
 
-def source_context_chunks(collection: str, raw_source: str) -> list:
+def source_context_chunks(collection: str, raw_source: str, user_id: str) -> list:
     points, _ = qc.scroll(
         collection_name=collection,
-        scroll_filter=models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="source",
-                    match=models.MatchValue(value=raw_source),
-                )
-            ]
-        ),
+        scroll_filter=user_payload_filter(user_id, raw_source),
         limit=256,
         with_payload=True,
         with_vectors=False,
@@ -247,6 +277,7 @@ def source_context_chunks(collection: str, raw_source: str) -> list:
     )[:DOC_CONTEXT_CHUNKS]
 
 def retrieve(state: State) -> State:
+    user_id = require_user_id(state)
     queries = [state["question"]]
     for query in state.get("subqueries", []):
         if query not in queries:
@@ -255,15 +286,16 @@ def retrieve(state: State) -> State:
         # Force only nas_docs for debugging
     collections = ["nas_docs"]
     current_query_text = " ".join(queries)
-    source_matches = mentioned_sources(current_query_text, collections)
+    source_matches = mentioned_sources(current_query_text, collections, user_id)
     if not source_matches:
         source_matches = mentioned_sources(
             f"{current_query_text} {recent_history_text(state.get('history', []))}",
             collections,
+            user_id,
         )
-    results = asyncio.run(retrieve_all(queries, collections, source_matches))
+    results = asyncio.run(retrieve_all(queries, collections, source_matches, user_id))
 
-    flat = keyword_match_chunks(collections, state["question"], source_matches)
+    flat = keyword_match_chunks(collections, state["question"], source_matches, user_id)
     for hits in results:
         for p in hits:
             flat.append({
@@ -272,11 +304,13 @@ def retrieve(state: State) -> State:
                 "source": p.payload["source"],
                 "page": p.payload["page"],
                 "hash": p.payload["hash"],
+                "user_id": p.payload.get("user_id"),
+                "isPublic": p.payload.get("isPublic") is True,
             })
 
     for collection, sources in source_matches.items():
         for raw_source in sources:
-            for p in source_context_chunks(collection, raw_source):
+            for p in source_context_chunks(collection, raw_source, user_id):
                 payload = p.payload or {}
                 flat.append({
                     "text": payload.get("text", ""),
@@ -284,6 +318,8 @@ def retrieve(state: State) -> State:
                     "source": payload.get("source", raw_source),
                     "page": payload.get("page"),
                     "hash": payload.get("hash", f"{raw_source}:{payload.get('page')}:{payload.get('chunk_index')}"),
+                    "user_id": payload.get("user_id"),
+                    "isPublic": payload.get("isPublic") is True,
                 })
 
     deduped = []
@@ -301,6 +337,7 @@ def retrieve(state: State) -> State:
     keyword_count = sum(1 for candidate in deduped if candidate.get("score") == 1.2)
     if keyword_count:
         print(f"[retrieve] exact keyword matches={keyword_count}")
+    assert_owned_candidates(deduped, user_id)
     new_state: State = dict(state)
     new_state["candidates"] = deduped
     return new_state

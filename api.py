@@ -24,9 +24,10 @@ from document_links import document_name, document_url
 
 # Data validation for request bodies
 from pydantic import BaseModel
+from qdrant_client import models
 
 # Env + OpenAI client
-from dotenv import load_dotenv
+from env_loader import load_app_env
 from openai import OpenAI
 
 # LangGraph agent (build once)
@@ -41,11 +42,12 @@ from db import (
     load_messages,
     load_messages_for_user,
     load_messages_owned,
+    delete_conversation,
     save_message,
 )
 
 # Load .env for OPENAI_API_KEY and Supabase / Neon settings
-load_dotenv()
+load_app_env()
 oai = OpenAI()
 
 # Create the FastAPI app object
@@ -183,9 +185,76 @@ def format_file_size(size: int | None) -> str:
         return f"{size / 1024:.1f} KB"
     return f"{size / (1024 * 1024):.1f} MB"
 
+def source_access_filter(user_id: str, raw_source: str) -> models.Filter:
+    return models.Filter(
+        must=[
+            models.FieldCondition(
+                key="source",
+                match=models.MatchValue(value=raw_source),
+            ),
+            models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="user_id",
+                        match=models.MatchValue(value=str(user_id)),
+                    ),
+                    models.FieldCondition(
+                        key="isPublic",
+                        match=models.MatchValue(value=True),
+                    ),
+                ]
+            ),
+        ]
+    )
+
+def indexed_documents_filter(user_id: str, visibility: str) -> models.Filter:
+    if visibility == "public":
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="isPublic",
+                    match=models.MatchValue(value=True),
+                )
+            ]
+        )
+    return models.Filter(
+        must=[
+            models.FieldCondition(
+                key="user_id",
+                match=models.MatchValue(value=str(user_id)),
+            )
+        ],
+        must_not=[
+            models.FieldCondition(
+                key="isPublic",
+                match=models.MatchValue(value=True),
+            )
+        ],
+    )
+
+def source_is_accessible(collection: str, source: str, user_id: str) -> bool:
+    try:
+        points, _ = qc.scroll(
+            collection_name=collection,
+            scroll_filter=source_access_filter(user_id, source),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+    except Exception:
+        return False
+    return bool(points)
+
 @app.get("/documents")
-def open_document(source: str, current_user: dict = Depends(get_current_user)):
+def open_document(
+    source: str,
+    collection: str = "nas_docs",
+    current_user: dict = Depends(get_current_user),
+):
     raw_source = source
+    if not source_is_accessible(collection, raw_source, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Document not found")
+
     candidate = find_document_file(raw_source)
     if candidate:
         return FileResponse(
@@ -226,19 +295,28 @@ def open_document(source: str, current_user: dict = Depends(get_current_user)):
 @app.get("/indexed-documents")
 def indexed_documents(
     collection: str = "nas_docs",
+    visibility: str = "private",
     current_user: dict = Depends(get_current_user),
 ):
+    visibility = visibility.lower().strip()
+    if visibility not in {"private", "public"}:
+        raise HTTPException(status_code=400, detail="visibility must be private or public")
+
     docs: dict[str, dict] = {}
     next_offset = None
 
     while True:
-        points, next_offset = qc.scroll(
-            collection_name=collection,
-            limit=256,
-            offset=next_offset,
-            with_payload=True,
-            with_vectors=False,
-        )
+        try:
+            points, next_offset = qc.scroll(
+                collection_name=collection,
+                scroll_filter=indexed_documents_filter(current_user["id"], visibility),
+                limit=256,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            return {"collection": collection, "visibility": visibility, "documents": []}
         for point in points:
             payload = point.payload or {}
             raw_source = str(payload.get("source") or "")
@@ -254,10 +332,18 @@ def indexed_documents(
                 "chunks": 0,
                 "original_source": raw_source,
                 "source": document_url(raw_source),
+                "isPublic": payload.get("isPublic") is True,
+                "indexed_by_email": payload.get("indexed_by_email") or payload.get("indexed_by"),
                 "size": None,
                 "last_indexed": None,
             })
             entry["chunks"] += 1
+            entry["isPublic"] = entry["isPublic"] or payload.get("isPublic") is True
+            entry["indexed_by_email"] = (
+                entry.get("indexed_by_email")
+                or payload.get("indexed_by_email")
+                or payload.get("indexed_by")
+            )
             if payload.get("page") is not None:
                 entry["pages"].add(payload["page"])
 
@@ -279,7 +365,7 @@ def indexed_documents(
         })
 
     items.sort(key=lambda d: d["name"].lower())
-    return {"collection": collection, "documents": items}
+    return {"collection": collection, "visibility": visibility, "documents": items}
 
 @app.get("/me")
 def current_user_profile(current_user: dict = Depends(get_current_user)):
@@ -312,11 +398,24 @@ def conversation_messages(
     return {"conversation_id": conversation_id, "messages": messages}
 
 
+@app.delete("/conversations/{conversation_id}")
+def remove_conversation(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    deleted = delete_conversation(db, conversation_id, current_user["id"])
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"success": True, "conversation_id": conversation_id}
+
+
 @app.post("/upload-document")
 async def upload_document(
     request: Request,
     x_filename: str = Header(..., alias="X-Filename"),
     x_collection: str = Header("nas_docs", alias="X-Collection"),
+    x_is_public: str = Header("false", alias="X-Is-Public"),
     current_user: dict = Depends(get_current_user),
 ):
     filename = clean_upload_filename(x_filename)
@@ -347,7 +446,14 @@ async def upload_document(
 
     local_path.write_bytes(content)
     try:
-        ingest(str(local_path), x_collection)
+        is_public = x_is_public.strip().lower() in {"1", "true", "yes", "public"}
+        ingest(
+            str(local_path),
+            x_collection,
+            user_id=current_user["id"],
+            is_public=is_public,
+            indexed_by_email=current_user.get("email"),
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Uploaded to NAS but ingest failed: {exc}") from exc
 
@@ -355,6 +461,8 @@ async def upload_document(
         "status": "ok",
         "document_name": filename,
         "collection": x_collection,
+        "isPublic": is_public,
+        "indexed_by_email": current_user.get("email"),
         "source": document_url(filename),
         "nas_url": nas_url,
     }
@@ -489,7 +597,7 @@ def query(
     history = load_messages(db, conversation_id)
 
     # 4) Run LangGraph agent with question + history
-    state = agent.invoke({"question": body.question, "history": history})
+    state = agent.invoke({"question": body.question, "history": history, "user_id": user_id})
     answer = state.get("answer", "")
 
     # 5) Persist the new turn in the DB
@@ -540,7 +648,7 @@ def query_stream(
         # Run graph once to get context, answer, and sources. Keeping this
         # inside the generator lets the browser see an open stream immediately.
         state = agent.invoke(
-            {"question": body.question, "history": history},
+            {"question": body.question, "history": history, "user_id": user_id},
             {"recursion_limit": 25},
         )
         answer = state["answer"]

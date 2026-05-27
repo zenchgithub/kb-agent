@@ -11,9 +11,9 @@ import uuid
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from dotenv import load_dotenv
+from env_loader import load_app_env
 
-load_dotenv()
+load_app_env()
 
 # Neon connection string from .env, for example:
 # DATABASE_URL=postgresql://neondb_owner:<PASSWORD>@ep-....neon.tech/neondb?sslmode=require
@@ -174,6 +174,26 @@ def load_messages_owned(db, conversation_id: str, user_id: str):
     if not user_owns_conversation(db, conversation_id, user_id):
         return None
     return load_messages(db, conversation_id)
+
+
+def delete_conversation(db, conversation_id: str, user_id: str) -> bool:
+    """
+    Delete a conversation and its messages only if it belongs to the user.
+    Returns False when the conversation does not exist for that user.
+    """
+    if not user_owns_conversation(db, conversation_id, user_id):
+        return False
+
+    db.execute(
+        text("delete from messages where conversation_id = :cid"),
+        {"cid": conversation_id},
+    )
+    db.execute(
+        text("delete from conversations where id = :cid and user_id = :user_id"),
+        {"cid": conversation_id, "user_id": user_id},
+    )
+    db.commit()
+    return True
 
 
 def save_message(db, conversation_id: str, role: str, content: str):

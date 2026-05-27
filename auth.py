@@ -7,9 +7,9 @@ from jose import jwt, JWTError
 import httpx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
+from env_loader import load_app_env
 
-load_dotenv()
+load_app_env()
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 JWKS_URL = os.getenv("SUPABASE_JWKS_URL", f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")

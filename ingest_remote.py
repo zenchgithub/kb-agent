@@ -1,9 +1,9 @@
 import sys
-from dotenv import load_dotenv
+from env_loader import load_app_env
 from fetch_remote import fetch_to_local
 from ingest import ingest
 
-load_dotenv()
+load_app_env()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

@@ -1,9 +1,9 @@
 import os
 import requests
 from urllib.parse import unquote, urlparse
-from dotenv import load_dotenv
+from env_loader import load_app_env
 
-load_dotenv()
+load_app_env()
 
 WEBDAV_USER = os.getenv("WEBDAV_USER")
 WEBDAV_PASS = os.getenv("WEBDAV_PASS")

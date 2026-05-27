@@ -2,9 +2,9 @@ import sys
 import os
 import requests
 from openai import OpenAI
-from dotenv import load_dotenv
+from env_loader import load_app_env
 
-load_dotenv()
+load_app_env()
 
 openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_ADMIN_KEY")
 if not openai_key:

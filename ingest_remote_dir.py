@@ -3,11 +3,11 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from dotenv import load_dotenv
+from env_loader import load_app_env
 from fetch_remote import fetch_to_local
 from ingest import ingest
 
-load_dotenv()
+load_app_env()
 
 BASE_URL = os.getenv("NAS_BASE_URL", "https://files.bezench.com/kb-agent/")
 

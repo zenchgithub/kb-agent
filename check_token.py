@@ -1,8 +1,8 @@
 from jose import jwt
 import os
-from dotenv import load_dotenv
+from env_loader import load_app_env
 
-load_dotenv()
+load_app_env()
 
 JWT_SECRET = os.environ["SUPABASE_JWT_SECRET"]
 token = os.environ["SUPABASE_ACCESS_TOKEN"]

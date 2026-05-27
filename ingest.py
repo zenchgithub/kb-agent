@@ -7,10 +7,10 @@ from urllib.parse import unquote
 from pypdf import PdfReader
 from openai import OpenAI
 from qdrant_client import models
-from dotenv import load_dotenv
 from config import get_qdrant_client
+from env_loader import load_app_env
 
-load_dotenv()
+load_app_env()
 
 # OpenAI + Qdrant clients (assumes local Qdrant)
 # Require an OpenAI API key in env for safety; prefer `OPENAI_API_KEY`
@@ -79,7 +79,12 @@ def chunk_text(text: str):
 			yield piece
 
 
-def extract(path: str):
+def extract(
+	path: str,
+	user_id: str | None = None,
+	is_public: bool = False,
+	indexed_by_email: str | None = None,
+):
 	"""Extract and print a short preview of each page in `path`.
 
 	Parameters
@@ -126,6 +131,12 @@ def extract(path: str):
 				"chunk_index": j,
 				"text": chunk,
 			}
+			if user_id:
+				meta["user_id"] = str(user_id)
+			meta["isPublic"] = bool(is_public)
+			if indexed_by_email:
+				meta["indexed_by_email"] = indexed_by_email
+				meta["indexed_by"] = indexed_by_email
 			chunks_with_meta.append(meta)
 
 		# Print summary info for this page: number of chunks and first preview.
@@ -200,9 +211,20 @@ def ingest_to_qdrant(chunks_with_meta: list[dict], collection: str):
 	print(f"✓ Ingested {total_upserted} chunks into '{collection}'")
 
 
-def ingest(pdf_path: str, collection: str):
+def ingest(
+	pdf_path: str,
+	collection: str,
+	user_id: str | None = None,
+	is_public: bool = False,
+	indexed_by_email: str | None = None,
+):
 	"""High-level helper: extract chunks from a PDF and push them into Qdrant."""
-	chunks_with_meta = extract(pdf_path)
+	chunks_with_meta = extract(
+		pdf_path,
+		user_id=user_id,
+		is_public=is_public,
+		indexed_by_email=indexed_by_email,
+	)
 	if not chunks_with_meta:
 		print("No chunks to ingest.")
 		return

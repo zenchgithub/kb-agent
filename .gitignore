@@ -10,4 +10,7 @@ wheels/
 # Virtual environments
 .venv
 .env
+.env.dev
+.env.qa
+.env.prod
 data/

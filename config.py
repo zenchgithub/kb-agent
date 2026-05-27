@@ -1,10 +1,10 @@
 import os
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
 from qdrant_client import QdrantClient
+from env_loader import load_app_env
 
-load_dotenv()
+load_app_env()
 
 
 def get_env(name: str, default: str = "") -> str:
