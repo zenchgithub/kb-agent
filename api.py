@@ -202,12 +202,23 @@ def source_access_filter(user_id: str, raw_source: str) -> models.Filter:
                         key="isPublic",
                         match=models.MatchValue(value=True),
                     ),
+                    models.IsEmptyCondition(
+                        is_empty=models.PayloadField(key="user_id"),
+                    ),
                 ]
             ),
         ]
     )
 
 def indexed_documents_filter(user_id: str, visibility: str) -> models.Filter:
+    if visibility == "old":
+        return models.Filter(
+            must=[
+                models.IsEmptyCondition(
+                    is_empty=models.PayloadField(key="user_id"),
+                )
+            ]
+        )
     if visibility == "public":
         return models.Filter(
             must=[
@@ -231,6 +242,12 @@ def indexed_documents_filter(user_id: str, visibility: str) -> models.Filter:
             )
         ],
     )
+
+def payload_is_legacy(payload: dict) -> bool:
+    return not payload.get("user_id")
+
+def payload_is_public(payload: dict) -> bool:
+    return payload.get("isPublic") is True or payload_is_legacy(payload)
 
 def source_is_accessible(collection: str, source: str, user_id: str) -> bool:
     try:
@@ -299,8 +316,8 @@ def indexed_documents(
     current_user: dict = Depends(get_current_user),
 ):
     visibility = visibility.lower().strip()
-    if visibility not in {"private", "public"}:
-        raise HTTPException(status_code=400, detail="visibility must be private or public")
+    if visibility not in {"private", "public", "old"}:
+        raise HTTPException(status_code=400, detail="visibility must be private, public, or old")
 
     docs: dict[str, dict] = {}
     next_offset = None
@@ -332,13 +349,15 @@ def indexed_documents(
                 "chunks": 0,
                 "original_source": raw_source,
                 "source": document_url(raw_source),
-                "isPublic": payload.get("isPublic") is True,
+                "isPublic": payload_is_public(payload),
+                "isLegacy": payload_is_legacy(payload),
                 "indexed_by_email": payload.get("indexed_by_email") or payload.get("indexed_by"),
                 "size": None,
                 "last_indexed": None,
             })
             entry["chunks"] += 1
-            entry["isPublic"] = entry["isPublic"] or payload.get("isPublic") is True
+            entry["isPublic"] = entry["isPublic"] or payload_is_public(payload)
+            entry["isLegacy"] = entry.get("isLegacy") or payload_is_legacy(payload)
             entry["indexed_by_email"] = (
                 entry.get("indexed_by_email")
                 or payload.get("indexed_by_email")

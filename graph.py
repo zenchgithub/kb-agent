@@ -74,6 +74,9 @@ def user_payload_filter(user_id: str, raw_source: str | None = None) -> models.F
                     key="isPublic",
                     match=models.MatchValue(value=True),
                 ),
+                models.IsEmptyCondition(
+                    is_empty=models.PayloadField(key="user_id"),
+                ),
             ]
         )
     ]
@@ -93,6 +96,9 @@ def assert_owned_candidates(candidates: list[dict], user_id: str):
         candidate_user_id = candidate.get("user_id")
         if candidate_user_id is not None and str(candidate_user_id) != user_id:
             raise PermissionError("cross-tenant hit detected")
+
+def payload_is_public(payload: dict) -> bool:
+    return payload.get("isPublic") is True or not payload.get("user_id")
 
 def access(state: State) -> State:
     user_id = require_user_id(state)
@@ -221,7 +227,7 @@ def keyword_match_chunks(
                             f"{raw_source}:{payload.get('page')}:{payload.get('chunk_index')}",
                         ),
                         "user_id": payload.get("user_id"),
-                        "isPublic": payload.get("isPublic") is True,
+                        "isPublic": payload_is_public(payload),
                     })
                     if len(matches) >= KEYWORD_TOPK:
                         return matches
@@ -305,7 +311,7 @@ def retrieve(state: State) -> State:
                 "page": p.payload["page"],
                 "hash": p.payload["hash"],
                 "user_id": p.payload.get("user_id"),
-                "isPublic": p.payload.get("isPublic") is True,
+                "isPublic": payload_is_public(p.payload or {}),
             })
 
     for collection, sources in source_matches.items():
@@ -319,7 +325,7 @@ def retrieve(state: State) -> State:
                     "page": payload.get("page"),
                     "hash": payload.get("hash", f"{raw_source}:{payload.get('page')}:{payload.get('chunk_index')}"),
                     "user_id": payload.get("user_id"),
-                    "isPublic": payload.get("isPublic") is True,
+                    "isPublic": payload_is_public(payload),
                 })
 
     deduped = []
