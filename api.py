@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -125,6 +126,17 @@ def require_current_admin(current_user: dict = Depends(get_current_user)) -> dic
     if is_admin_user(current_user["id"]):
         return current_user
     raise HTTPException(status_code=403, detail="Forbidden: admin role required")
+
+def validate_collection_name(collection: str) -> str:
+    name = collection.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Collection name is required")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise HTTPException(
+            status_code=400,
+            detail="Collection names may only contain letters, numbers, underscores, dots, and hyphens",
+        )
+    return name
 
 def load_invites() -> list[dict]:
     if not INVITES_FILE.exists():
@@ -509,11 +521,94 @@ async def upload_document(
 
 @app.post("/ingest-remote")
 async def ingest_remote(collection: str = "nas_docs", user=Depends(require_admin)):
+    collection = validate_collection_name(collection)
     try:
         ingest_remote_dir(collection)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"status": "ok", "collection": collection}
+
+
+class QdrantCollectionRequest(BaseModel):
+    collection: str = "nas_docs"
+    confirm: str | None = None
+
+
+class QdrantDeleteSourceRequest(BaseModel):
+    collection: str = "nas_docs"
+    source: str
+    confirm: str | None = None
+
+
+@app.get("/admin/qdrant/collections/{collection}")
+def admin_qdrant_collection(collection: str, user=Depends(require_current_admin)):
+    collection = validate_collection_name(collection)
+    try:
+        info = qc.get_collection(collection)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Collection not found or unavailable: {exc}") from exc
+
+    return {
+        "status": "ok",
+        "collection": collection,
+        "points_count": getattr(info, "points_count", None),
+        "indexed_vectors_count": getattr(info, "indexed_vectors_count", None),
+        "segments_count": getattr(info, "segments_count", None),
+        "optimizer_status": str(getattr(info, "optimizer_status", "")),
+    }
+
+
+@app.post("/admin/qdrant/reindex")
+def admin_qdrant_reindex(body: QdrantCollectionRequest, user=Depends(require_current_admin)):
+    collection = validate_collection_name(body.collection)
+    try:
+        ingest_remote_dir(collection)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {exc}") from exc
+    return {"status": "ok", "collection": collection}
+
+
+@app.post("/admin/qdrant/delete-source")
+def admin_qdrant_delete_source(body: QdrantDeleteSourceRequest, user=Depends(require_current_admin)):
+    collection = validate_collection_name(body.collection)
+    source = body.source.strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="Source is required")
+    expected = f"DELETE SOURCE {source}"
+    if body.confirm != expected:
+        raise HTTPException(status_code=400, detail=f'Type "{expected}" to confirm')
+
+    try:
+        qc.delete(
+            collection_name=collection,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="source",
+                            match=models.MatchValue(value=source),
+                        )
+                    ]
+                )
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Delete source failed: {exc}") from exc
+    return {"status": "deleted", "collection": collection, "source": source}
+
+
+@app.post("/admin/qdrant/delete-collection")
+def admin_qdrant_delete_collection(body: QdrantCollectionRequest, user=Depends(require_current_admin)):
+    collection = validate_collection_name(body.collection)
+    expected = f"DELETE {collection}"
+    if body.confirm != expected:
+        raise HTTPException(status_code=400, detail=f'Type "{expected}" to confirm')
+
+    try:
+        qc.delete_collection(collection)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Delete collection failed: {exc}") from exc
+    return {"status": "deleted", "collection": collection}
 
 @app.options("/{path:path}")
 async def options_handler(request: Request) -> Response:

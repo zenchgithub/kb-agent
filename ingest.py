@@ -1,297 +1,709 @@
-import sys
-import uuid
+from __future__ import annotations
+
 import hashlib
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import uuid
+from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any, Callable, Literal
 from urllib.parse import unquote
-from pypdf import PdfReader
+
+import fitz  # PyMuPDF
 from openai import OpenAI
+from pydantic import BaseModel, Field
 from qdrant_client import models
+
 from config import get_qdrant_client
 from env_loader import load_app_env
 
 load_app_env()
 
-# OpenAI + Qdrant clients (assumes local Qdrant)
-# Require an OpenAI API key in env for safety; prefer `OPENAI_API_KEY`
+DocType = Literal[
+    "passport",
+    "id_card",
+    "visa",
+    "uscis_form",
+    "affidavit",
+    "lease",
+    "generic_pdf",
+]
+ChunkType = Literal["body", "heading", "table", "key_value", "identity_field", "header", "footer"]
+
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIM = 1536
+MIN_CHARS = 50
+OCR_DPI = 220
+DEFAULT_CHUNK_CHARS = 1800
+DEFAULT_OVERLAP_CHARS = 260
+
 _openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_ADMIN_KEY")
 if not _openai_key:
-	print("Missing OPENAI_API_KEY or OPENAI_ADMIN_KEY. Set it in .env or export it in your shell.")
-	sys.exit(1)
+    print("Missing OPENAI_API_KEY or OPENAI_ADMIN_KEY. Set it in .env or export it in your shell.")
+    sys.exit(1)
 if not shutil.which("tesseract"):
-	print("Warning: tesseract is not installed. Scanned/image-only PDFs will not be OCR-indexed.")
+    print("Warning: tesseract is not installed. Scanned/image-only PDFs will not be OCR-indexed.")
 
 oai = OpenAI(api_key=_openai_key)
 qc = get_qdrant_client()
 
-"""
-Simple PDF text extractor script.
 
-This module provides a tiny command-line helper to read a PDF file and
-print a short preview of each page's extracted text. It's intentionally
-minimal: the goal is to inspect that text extraction is working and to
-see the first ~500 characters of each page for quick debugging.
-
-Notes:
-- Uses `pypdf.PdfReader` to read the file and access `reader.pages`.
-- `page.extract_text()` may return None when no text can be extracted
-  (for scanned pages or complex encodings); we normalize that to an
-  empty string before measuring or printing.
-- This script prints only the first 500 characters per page to avoid
-  flooding the terminal for large pages.
-"""
+class IdentityFields(BaseModel):
+    full_name: str | None = None
+    given_name: str | None = None
+    surname: str | None = None
+    nationality: str | None = None
+    passport_number: str | None = None
+    id_number: str | None = None
+    country_of_issue: str | None = None
+    issuing_state: str | None = None
+    date_of_birth: str | None = None
+    date_of_issue: str | None = None
+    date_of_expiry: str | None = None
+    document_type: str | None = None
 
 
-# Chunking configuration (word counts)
-# CHUNK_SIZE: approximate number of words per chunk
-# OVERLAP: number of words to overlap between consecutive chunks
-# MIN_CHARS: discard chunks smaller than this many characters
-CHUNK_SIZE = 800
-OVERLAP = 100
-MIN_CHARS = 50
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536
-OCR_DPI = 200
+class PageText(BaseModel):
+    page: int
+    text: str
+    markdown: str | None = None
+    key_values: dict[str, str] = Field(default_factory=dict)
+    tables: list[str] = Field(default_factory=list)
+
+
+class Document(BaseModel):
+    document_id: str
+    file_name: str
+    doc_type: DocType
+    full_text: str
+    pages: list[PageText]
+    identity_fields: IdentityFields | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class Chunk(BaseModel):
+    chunk_id: str
+    document_id: str
+    file_name: str
+    doc_type: DocType
+    page: int | None = None
+    section: str | None = None
+    heading: str | None = None
+    field_label: str | None = None
+    person_name: str | None = None
+    entities: list[str] = Field(default_factory=list)
+    chunk_type: ChunkType = "body"
+    text: str
+    summary: str | None = None
+    keywords: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OCRResult(BaseModel):
+    pages: list[PageText]
+    raw_response: dict[str, Any] = Field(default_factory=dict)
+
+
+class IdentityExtractionResult(BaseModel):
+    fields: IdentityFields
+    confidence: float | None = None
+    raw_response: dict[str, Any] = Field(default_factory=dict)
+
+
+class OCRProvider(ABC):
+    @abstractmethod
+    def extract_pdf(self, pdf_path: Path) -> OCRResult:
+        """Return normalized page text, key-values, and tables from a scanned PDF."""
+
+
+class IdentityProvider(ABC):
+    @abstractmethod
+    def extract_identity(self, pdf_path: Path, pages: list[PageText]) -> IdentityExtractionResult:
+        """Return normalized passport/ID fields."""
+
+
+class AzureDocumentIntelligenceOCRProvider(OCRProvider):
+    """Adapter placeholder for Azure Document Intelligence Read/Layout.
+
+    Keep provider output normalized to PageText so the rest of the pipeline does
+    not depend on Azure. Swap this class for Google Document AI, Textract, etc.
+    without changing chunking or Qdrant code.
+    """
+
+    def __init__(self, endpoint: str, key: str):
+        self.endpoint = endpoint
+        self.key = key
+
+    def extract_pdf(self, pdf_path: Path) -> OCRResult:
+        raise NotImplementedError("Wire Azure Document Intelligence Read/Layout here")
+
+
+class AzureIdentityProvider(IdentityProvider):
+    """Adapter placeholder for Azure prebuilt ID/custom passport model."""
+
+    def __init__(self, endpoint: str, key: str):
+        self.endpoint = endpoint
+        self.key = key
+
+    def extract_identity(self, pdf_path: Path, pages: list[PageText]) -> IdentityExtractionResult:
+        raise NotImplementedError("Wire Azure identity extraction here")
+
+
+class LocalTesseractOCRProvider(OCRProvider):
+    """Local fallback OCR.
+
+    This is useful for development and simple scanned PDFs. For production
+    passports, visas, stamps, and rotated IDs, prefer a document-intelligence
+    provider that returns layout and key-value fields.
+    """
+
+    def extract_pdf(self, pdf_path: Path) -> OCRResult:
+        pages: list[PageText] = []
+        doc = fitz.open(str(pdf_path))
+        try:
+            for index, page in enumerate(doc, start=1):
+                pages.append(PageText(page=index, text=ocr_pdf_page(pdf_path, index - 1)))
+        finally:
+            doc.close()
+        return OCRResult(pages=pages)
+
+
+class HeuristicIdentityProvider(IdentityProvider):
+    """Best-effort local field extraction from OCR/digital text.
+
+    This is deliberately conservative. It helps retrieval immediately, but a
+    real ID provider should replace it for production-grade passports/IDs.
+    """
+
+    def extract_identity(self, pdf_path: Path, pages: list[PageText]) -> IdentityExtractionResult:
+        text = "\n".join(page.text for page in pages)
+        fields = IdentityFields(document_type="passport" if "passport" in text.lower() else None)
+
+        def first(patterns: list[str]) -> str | None:
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+                if match:
+                    return clean_text(match.group(1))
+            return None
+
+        fields.nationality = first([
+            r"\bNationality\s*[:\-]?\s*([A-Z][A-Za-z \-/]{2,40})",
+            r"\bCitizenship\s*[:\-]?\s*([A-Z][A-Za-z \-/]{2,40})",
+        ])
+        fields.passport_number = first([
+            r"\bPassport\s*(?:No\.?|Number|#)\s*[:\-]?\s*([A-Z0-9]{5,20})",
+            r"\bDocument\s*(?:No\.?|Number|#)\s*[:\-]?\s*([A-Z0-9]{5,20})",
+        ])
+        fields.date_of_birth = first([
+            r"\bDate of Birth\s*[:\-]?\s*([0-9A-Za-z/ .\-]{6,25})",
+            r"\bDOB\s*[:\-]?\s*([0-9A-Za-z/ .\-]{6,25})",
+        ])
+        fields.date_of_expiry = first([
+            r"\bDate of Expiry\s*[:\-]?\s*([0-9A-Za-z/ .\-]{6,25})",
+            r"\bExpiration Date\s*[:\-]?\s*([0-9A-Za-z/ .\-]{6,25})",
+        ])
+        fields.date_of_issue = first([
+            r"\bDate of Issue\s*[:\-]?\s*([0-9A-Za-z/ .\-]{6,25})",
+            r"\bIssue Date\s*[:\-]?\s*([0-9A-Za-z/ .\-]{6,25})",
+        ])
+        fields.country_of_issue = first([
+            r"\bCountry of Issue\s*[:\-]?\s*([A-Z][A-Za-z \-/]{2,40})",
+            r"\bIssuing Country\s*[:\-]?\s*([A-Z][A-Za-z \-/]{2,40})",
+        ])
+        fields.full_name = first([
+            r"\bFull Name\s*[:\-]?\s*([A-Z][A-Za-z ,.'\-]{3,80})",
+            r"\bName\s*[:\-]?\s*([A-Z][A-Za-z ,.'\-]{3,80})",
+        ])
+        return IdentityExtractionResult(fields=fields)
+
+
+def clean_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def stable_id(*parts: str) -> str:
+    return hashlib.sha256("::".join(parts).encode("utf-8")).hexdigest()
+
+
+def stable_uuid(*parts: str) -> str:
+    """Return a deterministic UUID string accepted by Qdrant point IDs."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "::".join(parts)))
 
 
 def display_source(path: Path) -> str:
-	"""Return a clean filename for API citations."""
-	return unquote(path.name).strip()
+    return unquote(path.name).strip()
 
 
-def chunk_text(text: str):
-	"""Yield chunks of `text` as strings.
+def is_scanned_pdf(pdf_path: str | Path, min_chars_per_page: int = 40) -> bool:
+    """Detect image-only PDFs by checking for usable text layer.
 
-	Splits `text` into words and yields pieces of approximately
-	`CHUNK_SIZE` words, advancing by `CHUNK_SIZE - OVERLAP` words each
-	step. Chunks shorter than `MIN_CHARS` characters are skipped.
-	"""
+    A PDF can contain images and still be digital, so image presence alone is
+    not enough. If fewer than ~35% of pages have meaningful text, route to OCR.
+    """
 
-	words = text.split()
-	if not words:
-		return
+    path = Path(pdf_path)
+    doc = fitz.open(str(path))
+    try:
+        if len(doc) == 0:
+            return True
+        text_pages = 0
+        for page in doc:
+            if len(clean_text(page.get_text("text") or "")) >= min_chars_per_page:
+                text_pages += 1
+        return (text_pages / max(len(doc), 1)) < 0.35
+    finally:
+        doc.close()
 
-	step = CHUNK_SIZE - OVERLAP
-	if step <= 0:
-		step = CHUNK_SIZE
 
-	for i in range(0, len(words), step):
-		piece_words = words[i : i + CHUNK_SIZE]
-		piece = " ".join(piece_words).strip()
-		if len(piece) > MIN_CHARS:
-			yield piece
+def detect_document_type(pdf_path: str | Path, sample_text: str = "") -> DocType:
+    path = Path(pdf_path)
+    haystack = f"{path.name}\n{sample_text[:4000]}".lower()
+    if any(term in haystack for term in ("passport", "nationality", "date of expiry", "place of birth")):
+        return "passport"
+    if any(term in haystack for term in ("identity card", "id card", "identification card")):
+        return "id_card"
+    if any(term in haystack for term in ("visa", "nonimmigrant", "immigrant visa")):
+        return "visa"
+    if any(term in haystack for term in ("i-485", "i-130", "i-589", "uscis", "alien registration")):
+        return "uscis_form"
+    if "affidavit" in haystack:
+        return "affidavit"
+    if "lease" in haystack:
+        return "lease"
+    return "generic_pdf"
+
+
+def extract_digital_pdf(pdf_path: str | Path) -> list[PageText]:
+    """Extract digital PDF text with PyMuPDF.
+
+    PyMuPDF is preferred over pypdf because block extraction gives us geometry.
+    Sorting blocks top-to-bottom and left-to-right mitigates broken stream order
+    and many multi-column layouts. `find_tables()` keeps tables as table chunks
+    instead of flattening them into unreadable prose. Font encoding and ligature
+    problems can still happen in malformed PDFs, but PyMuPDF generally handles
+    embedded font maps better than pypdf.
+    """
+
+    path = Path(pdf_path)
+    doc = fitz.open(str(path))
+    pages: list[PageText] = []
+    try:
+        for page_index, page in enumerate(doc, start=1):
+            blocks = page.get_text("blocks") or []
+            blocks = sorted(blocks, key=lambda b: (round(b[1], 1), round(b[0], 1)))
+            parts = [clean_text(str(block[4] or "")) for block in blocks]
+            text = clean_text("\n\n".join(part for part in parts if part))
+
+            tables: list[str] = []
+            try:
+                for table in page.find_tables().tables:
+                    rows = table.extract()
+                    rendered = "\n".join(
+                        " | ".join(clean_text(str(cell or "")) for cell in row)
+                        for row in rows
+                    )
+                    if rendered.strip():
+                        tables.append(rendered)
+            except Exception:
+                pass
+
+            pages.append(PageText(page=page_index, text=text, tables=tables))
+    finally:
+        doc.close()
+    return pages
 
 
 def ocr_pdf_page(pdf_path: Path, page_index: int) -> str:
-	"""OCR one PDF page by rendering it to an image and running Tesseract."""
-	if not shutil.which("tesseract"):
-		return ""
-
-	try:
-		import fitz  # PyMuPDF
-	except Exception as exc:
-		print(f"OCR skipped: PyMuPDF is unavailable ({exc})")
-		return ""
-
-	try:
-		doc = fitz.open(str(pdf_path))
-		try:
-			page = doc.load_page(page_index)
-			pix = page.get_pixmap(dpi=OCR_DPI, alpha=False)
-			with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as image_file:
-				pix.save(image_file.name)
-				result = subprocess.run(
-					["tesseract", image_file.name, "stdout", "--psm", "6"],
-					check=False,
-					capture_output=True,
-					text=True,
-					timeout=60,
-				)
-				if result.returncode != 0:
-					print(f"OCR failed on page {page_index + 1}: {result.stderr.strip()}")
-					return ""
-				return result.stdout.strip()
-		finally:
-			doc.close()
-	except Exception as exc:
-		print(f"OCR failed on page {page_index + 1}: {exc}")
-		return ""
+    if not shutil.which("tesseract"):
+        return ""
+    try:
+        doc = fitz.open(str(pdf_path))
+        try:
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(dpi=OCR_DPI, alpha=False)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as image_file:
+                pix.save(image_file.name)
+                result = subprocess.run(
+                    ["tesseract", image_file.name, "stdout", "--psm", "6"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                if result.returncode != 0:
+                    print(f"OCR failed on page {page_index + 1}: {result.stderr.strip()}")
+                    return ""
+                return clean_text(result.stdout)
+        finally:
+            doc.close()
+    except Exception as exc:
+        print(f"OCR failed on page {page_index + 1}: {exc}")
+        return ""
 
 
-def extract(
-	path: str,
-	user_id: str | None = None,
-	is_public: bool = False,
-	indexed_by_email: str | None = None,
-):
-	"""Extract and print a short preview of each page in `path`.
-
-	Parameters
-	- path: filesystem path to a PDF file. Can be a str or path-like.
-
-	Behavior
-	- If the file does not exist, prints an error and returns.
-	- Otherwise opens the PDF with `PdfReader`, prints the page count,
-	  then iterates pages and prints a 500-character preview per page.
-	"""
-
-	# Normalize to a Path object for convenience and safer existence checks
-	path = Path(path)
-
-	# Inform the user if the file is missing rather than letting PdfReader
-	# raise a lower-level exception. This makes the script friendlier.
-	if not path.exists():
-		print(f"File not found: {path}")
-		return
-
-	# Create a PdfReader instance which parses the PDF structure.
-	# Note: PdfReader may still raise for corrupt or unsupported PDFs.
-	reader = PdfReader(path)
-
-	# `reader.pages` is a sequence-like of page objects.
-	print(f"Pages: {len(reader.pages)}")
-
-	# Collect chunks with metadata for the whole document if needed.
-	chunks_with_meta = []
-
-	# Loop over pages and extract text, then chunk each page's full text.
-	for i, page in enumerate(reader.pages, 1):
-		# extract_text() can return None; use empty string as fallback.
-		text = page.extract_text() or ""
-		if len(text.strip()) < MIN_CHARS:
-			ocr_text = ocr_pdf_page(path, i - 1)
-			if len(ocr_text.strip()) > len(text.strip()):
-				text = ocr_text
-
-		# Create chunks from the full page text.
-		page_chunks = list(chunk_text(text))
-
-		# Attach metadata to each chunk (source path, page number, index).
-		for j, chunk in enumerate(page_chunks, 1):
-			meta = {
-				"source": display_source(path),
-				"page": i,
-				"chunk_index": j,
-				"text": chunk,
-			}
-			if user_id:
-				meta["user_id"] = str(user_id)
-			meta["isPublic"] = bool(is_public)
-			if indexed_by_email:
-				meta["indexed_by_email"] = indexed_by_email
-				meta["indexed_by"] = indexed_by_email
-			chunks_with_meta.append(meta)
-
-		# Print summary info for this page: number of chunks and first preview.
-		print(f"--- Page {i} ({len(text)} chars) ---")
-		print(f"Chunks: {len(page_chunks)}")
-		if page_chunks:
-			# Preview the first chunk (trim to 500 chars for display).
-			print("First chunk:", page_chunks[0][:500])
-		print()
-
-	# Document-level summary: total chunks found
-	print(f"Total chunks collected: {len(chunks_with_meta)}")
-    
-	# Return collected chunks for possible downstream ingestion
-	return chunks_with_meta
+def extract_scanned_pdf(pdf_path: str | Path, ocr_provider: OCRProvider | None = None) -> list[PageText]:
+    provider = ocr_provider or LocalTesseractOCRProvider()
+    return provider.extract_pdf(Path(pdf_path)).pages
 
 
-def ensure_collection(name: str):
-	"""Create the Qdrant collection if it doesn't exist."""
-	try:
-		qc.get_collection(name)
-	except Exception:
-		qc.create_collection(
-			collection_name=name,
-			vectors_config=models.VectorParams(size=EMBED_DIM, distance=models.Distance.COSINE),
-		)
-		print(f"Created collection: {name}")
+def extract_identity_fields(
+    pdf_path: str | Path,
+    pages: list[PageText],
+    identity_provider: IdentityProvider | None = None,
+) -> IdentityFields | None:
+    provider = identity_provider or HeuristicIdentityProvider()
+    fields = provider.extract_identity(Path(pdf_path), pages).fields
+    return fields if fields.model_dump(exclude_none=True) else None
+
+
+def build_document(
+    pdf_path: str | Path,
+    ocr_provider: OCRProvider | None = None,
+    identity_provider: IdentityProvider | None = None,
+) -> Document:
+    path = Path(pdf_path)
+    scanned = is_scanned_pdf(path)
+    pages = extract_scanned_pdf(path, ocr_provider) if scanned else extract_digital_pdf(path)
+
+    # Some PDFs have a text layer but broken extraction. OCR weak pages only.
+    repaired_pages: list[PageText] = []
+    for page in pages:
+        if len(page.text.strip()) < MIN_CHARS:
+            ocr_text = ocr_pdf_page(path, page.page - 1)
+            if len(ocr_text) > len(page.text):
+                page = page.model_copy(update={"text": ocr_text})
+        repaired_pages.append(page)
+    pages = repaired_pages
+
+    full_text = clean_text("\n\n".join(page.text for page in pages))
+    doc_type = detect_document_type(path, full_text)
+    identity_fields = None
+    if doc_type in {"passport", "id_card", "visa"}:
+        identity_fields = extract_identity_fields(path, pages, identity_provider)
+
+    return Document(
+        document_id=str(uuid.uuid4()),
+        file_name=display_source(path),
+        doc_type=doc_type,
+        full_text=full_text,
+        pages=pages,
+        identity_fields=identity_fields,
+        metadata={"is_scanned": scanned, "page_count": len(pages)},
+    )
+
+
+def derive_keywords(text: str) -> list[str]:
+    labels = [
+        "nationality",
+        "citizenship",
+        "passport number",
+        "date of birth",
+        "date of expiry",
+        "date of issue",
+        "attorney",
+        "employer",
+        "address",
+        "alien number",
+        "receipt number",
+    ]
+    lower = text.lower()
+    return [label for label in labels if label in lower]
+
+
+def infer_heading(text: str) -> str | None:
+    first = text.splitlines()[0].strip() if text.splitlines() else ""
+    if 3 <= len(first) <= 100 and not first.endswith("."):
+        return first
+    return None
+
+
+def chunk_text_block(text: str, max_chars: int = DEFAULT_CHUNK_CHARS, overlap_chars: int = DEFAULT_OVERLAP_CHARS) -> list[str]:
+    text = clean_text(text)
+    if not text:
+        return []
+    paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        if len(current) + len(paragraph) + 2 <= max_chars:
+            current = f"{current}\n\n{paragraph}".strip()
+        else:
+            if current:
+                chunks.append(current)
+            overlap = current[-overlap_chars:] if current else ""
+            current = f"{overlap}\n\n{paragraph}".strip() if overlap else paragraph
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def identity_field_chunks(document: Document) -> list[Chunk]:
+    if not document.identity_fields:
+        return []
+    fields = document.identity_fields.model_dump(exclude_none=True)
+    person_name = (
+        document.identity_fields.full_name
+        or " ".join(x for x in [document.identity_fields.given_name, document.identity_fields.surname] if x)
+        or None
+    )
+    chunks: list[Chunk] = []
+    for label, value in fields.items():
+        text = f"{label.replace('_', ' ').title()}: {value}"
+        chunks.append(
+            Chunk(
+                chunk_id=stable_id(document.document_id, label, str(value)),
+                document_id=document.document_id,
+                file_name=document.file_name,
+                doc_type=document.doc_type,
+                field_label=label,
+                person_name=person_name,
+                entities=[person_name] if person_name else [],
+                chunk_type="identity_field",
+                text=text,
+                keywords=[label, str(value)],
+                metadata={"structured_identity": True},
+            )
+        )
+    return chunks
+
+
+def enrich_chunk_metadata(chunk: Chunk, chunk_index: int) -> Chunk:
+    text = clean_text(chunk.text)
+    summary = text[:240] + "..." if len(text) > 240 else text
+    metadata = {
+        **chunk.metadata,
+        "document_id": chunk.document_id,
+        "file_name": chunk.file_name,
+        "doc_type": chunk.doc_type,
+        "page": chunk.page,
+        "chunk_index": chunk_index,
+        "field_label": chunk.field_label,
+        "person_name": chunk.person_name,
+        "chunk_type": chunk.chunk_type,
+        "keywords": chunk.keywords,
+        "section": chunk.section,
+        "heading": chunk.heading,
+    }
+    return chunk.model_copy(update={"text": text, "summary": summary, "metadata": metadata})
+
+
+def chunk_document(document: Document) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    chunks.extend(identity_field_chunks(document))
+
+    for page in document.pages:
+        for label, value in page.key_values.items():
+            chunks.append(
+                Chunk(
+                    chunk_id=stable_id(document.document_id, str(page.page), label, value),
+                    document_id=document.document_id,
+                    file_name=document.file_name,
+                    doc_type=document.doc_type,
+                    page=page.page,
+                    field_label=label,
+                    chunk_type="key_value",
+                    text=f"{label}: {value}",
+                    keywords=[label, value],
+                )
+            )
+        for table_index, table in enumerate(page.tables):
+            chunks.append(
+                Chunk(
+                    chunk_id=stable_id(document.document_id, str(page.page), "table", str(table_index)),
+                    document_id=document.document_id,
+                    file_name=document.file_name,
+                    doc_type=document.doc_type,
+                    page=page.page,
+                    chunk_type="table",
+                    text=table,
+                    keywords=["table"],
+                )
+            )
+        for index, text in enumerate(chunk_text_block(page.text), start=1):
+            heading = infer_heading(text)
+            chunks.append(
+                Chunk(
+                    chunk_id=stable_id(document.document_id, str(page.page), str(index), text[:80]),
+                    document_id=document.document_id,
+                    file_name=document.file_name,
+                    doc_type=document.doc_type,
+                    page=page.page,
+                    heading=heading,
+                    section=heading,
+                    chunk_type="body",
+                    text=text,
+                    keywords=derive_keywords(text),
+                )
+            )
+
+    return [enrich_chunk_metadata(chunk, index) for index, chunk in enumerate(chunks, start=1)]
+
+
+def build_qdrant_payloads(
+    chunks: list[Chunk],
+    user_id: str | None = None,
+    is_public: bool = False,
+    indexed_by_email: str | None = None,
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for chunk in chunks:
+        payload = {
+            **chunk.metadata,
+            "chunk_id": chunk.chunk_id,
+            "point_id": stable_uuid(chunk.document_id, chunk.chunk_id),
+            "source": chunk.file_name,
+            "text": chunk.text,
+            "summary": chunk.summary,
+            "entities": chunk.entities,
+            "hash": hashlib.md5(chunk.text.encode("utf-8")).hexdigest(),
+            "isPublic": bool(is_public),
+        }
+        if user_id:
+            payload["user_id"] = str(user_id)
+        if indexed_by_email:
+            payload["indexed_by_email"] = indexed_by_email
+            payload["indexed_by"] = indexed_by_email
+        payloads.append(payload)
+    return payloads
+
+
+def ensure_collection(name: str) -> None:
+    try:
+        qc.get_collection(name)
+    except Exception:
+        qc.create_collection(
+            collection_name=name,
+            vectors_config=models.VectorParams(size=EMBED_DIM, distance=models.Distance.COSINE),
+        )
+        print(f"Created collection: {name}")
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
-	"""Get embeddings for a batch of texts from OpenAI.
-
-	Returns a list of vectors (lists of floats) matching `texts` order.
-	"""
-	resp = oai.embeddings.create(model=EMBED_MODEL, input=texts)
-	return [d.embedding for d in resp.data]
+    resp = oai.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [item.embedding for item in resp.data]
 
 
-def ingest_to_qdrant(chunks_with_meta: list[dict], collection: str):
-	"""Embed chunks and upsert into Qdrant with metadata payload.
+def ingest_to_qdrant(chunks_with_meta: list[dict[str, Any]], collection: str) -> int:
+    ensure_collection(collection)
+    total_upserted = 0
+    batch_size = 100
 
-	- chunks_with_meta: list of dicts with at least keys `text`, `source`,
-	  `page`, `chunk_index`.
-	- collection: target Qdrant collection name.
-	"""
+    for start in range(0, len(chunks_with_meta), batch_size):
+        batch = chunks_with_meta[start : start + batch_size]
+        embeddings = embed_batch([item["text"] for item in batch])
+        points = [
+            models.PointStruct(
+                id=item.get("point_id") or stable_uuid(str(item.get("chunk_id") or uuid.uuid4())),
+                vector=vector,
+                payload=item,
+            )
+            for item, vector in zip(batch, embeddings)
+        ]
+        qc.upsert(collection_name=collection, points=points)
+        total_upserted += len(points)
 
-	ensure_collection(collection)
+    print(f"✓ Ingested {total_upserted} chunks into '{collection}'")
+    return total_upserted
 
-	# Batch size for embedding API calls
-	BATCH = 100
-	total_upserted = 0
 
-	for i in range(0, len(chunks_with_meta), BATCH):
-		batch = chunks_with_meta[i : i + BATCH]
-		texts = [c["text"] for c in batch]
+def extract(
+    path: str,
+    user_id: str | None = None,
+    is_public: bool = False,
+    indexed_by_email: str | None = None,
+) -> list[dict[str, Any]]:
+    pdf_path = Path(path)
+    if not pdf_path.exists():
+        print(f"File not found: {pdf_path}")
+        return []
 
-		# Request embeddings
-		embeddings = embed_batch(texts)
+    document = build_document(pdf_path)
+    chunks = chunk_document(document)
+    payloads = build_qdrant_payloads(chunks, user_id=user_id, is_public=is_public, indexed_by_email=indexed_by_email)
 
-		points = []
-		for c, vec in zip(batch, embeddings):
-			h = hashlib.md5(c["text"].encode()).hexdigest()
-			payload = {**c, "hash": h}
-			points.append(
-				models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=payload)
-			)
-
-		# Upsert this batch into Qdrant
-		qc.upsert(collection_name=collection, points=points)
-		total_upserted += len(points)
-
-	print(f"✓ Ingested {total_upserted} chunks into '{collection}'")
-	return total_upserted
+    print(f"Document type: {document.doc_type}")
+    print(f"Scanned: {document.metadata.get('is_scanned')}")
+    print(f"Pages: {len(document.pages)}")
+    print(f"Total chunks collected: {len(payloads)}")
+    if document.identity_fields:
+        print(f"Identity fields: {document.identity_fields.model_dump(exclude_none=True)}")
+    if payloads:
+        print("First chunk:", payloads[0]["text"][:500])
+    return payloads
 
 
 def ingest(
-	pdf_path: str,
-	collection: str,
-	user_id: str | None = None,
-	is_public: bool = False,
-	indexed_by_email: str | None = None,
-):
-	"""High-level helper: extract chunks from a PDF and push them into Qdrant."""
-	chunks_with_meta = extract(
-		pdf_path,
-		user_id=user_id,
-		is_public=is_public,
-		indexed_by_email=indexed_by_email,
-	)
-	if not chunks_with_meta:
-		print("No chunks to ingest.")
-		return 0
-	return ingest_to_qdrant(chunks_with_meta, collection)
+    pdf_path: str,
+    collection: str,
+    user_id: str | None = None,
+    is_public: bool = False,
+    indexed_by_email: str | None = None,
+) -> int:
+    chunks_with_meta = extract(
+        pdf_path,
+        user_id=user_id,
+        is_public=is_public,
+        indexed_by_email=indexed_by_email,
+    )
+    if not chunks_with_meta:
+        print("No chunks to ingest.")
+        return 0
+    return ingest_to_qdrant(chunks_with_meta, collection)
+
+
+def ingest_pdf(
+    pdf_path: str | Path,
+    collection: str,
+    user_id: str | None,
+    embed: Callable[[str], list[float]] | None = None,
+    is_public: bool = False,
+    indexed_by_email: str | None = None,
+) -> dict[str, Any]:
+    """Example composable flow for tests or future API code."""
+
+    document = build_document(pdf_path)
+    chunks = chunk_document(document)
+    payloads = build_qdrant_payloads(chunks, user_id=user_id, is_public=is_public, indexed_by_email=indexed_by_email)
+    if embed is None:
+        indexed = ingest_to_qdrant(payloads, collection)
+    else:
+        ensure_collection(collection)
+        points = [
+            models.PointStruct(
+                id=payload.get("point_id") or stable_uuid(str(payload["chunk_id"])),
+                vector=embed(payload["text"]),
+                payload=payload,
+            )
+            for payload in payloads
+        ]
+        if points:
+            qc.upsert(collection_name=collection, points=points)
+        indexed = len(points)
+    return {
+        "document": document.model_dump(),
+        "chunks": [chunk.model_dump() for chunk in chunks],
+        "chunks_indexed": indexed,
+        "full_text": document.full_text,
+        "identity_fields": document.identity_fields.model_dump() if document.identity_fields else None,
+    }
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python ingest.py <pdf-path> [collection]")
+        sys.exit(1)
 
-	# Basic CLI argument validation so the user sees a helpful message
-	# instead of an index error when no path is provided.
-	if len(sys.argv) < 2:
-		print("Usage: python ingest.py <pdf-path> [collection]")
-		sys.exit(1)
-
-	pdf_path = sys.argv[1]
-	collection = sys.argv[2] if len(sys.argv) > 2 else None
-
-	# If a collection was provided, run the high-level ingest helper.
-	if collection:
-		ingest(pdf_path, collection)
-	else:
-		# Otherwise just extract and print a preview of chunks.
-		extract(pdf_path)
+    pdf_path_arg = sys.argv[1]
+    collection_arg = sys.argv[2] if len(sys.argv) > 2 else None
+    if collection_arg:
+        ingest(pdf_path_arg, collection_arg)
+    else:
+        extract(pdf_path_arg)
