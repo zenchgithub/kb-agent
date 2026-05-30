@@ -352,6 +352,7 @@ Pipeline nodes:
 - `db.*` for conversation/message persistence.
 - `ingest.ingest` and `ingest_remote_dir.ingest_remote_dir` for document ingestion.
 - `document_links.document_name` and `document_links.document_url` for URL helpers.
+- `model_config.*` for dynamic planner, reranker, answer, and embedding model selection.
 
 ### Startup actions in `api.py`
 
@@ -424,6 +425,25 @@ These endpoints are used by the admin-only Settings UI. The frontend calls the b
 - `POST /admin/qdrant/delete-collection`
   - deletes the full Qdrant collection.
   - requires confirmation text: `DELETE <collection>`.
+
+### Admin model configuration endpoints
+
+Model choices are centralized in `model_config.py`. The production defaults are:
+
+- Planner: `gpt-5-mini`
+- Reranker: `gpt-5-mini`
+- Answer synthesis: `gpt-5-mini`
+- Embeddings: `text-embedding-3-large`
+- Embedding dimensions: `1536`
+
+The 1536-dimension setting keeps the stronger embedding model compatible with the existing Qdrant collection size.
+
+- `GET /admin/model-config`
+  - returns the active config, defaults, available model options, and descriptions for each RAG step.
+
+- `PUT /admin/model-config`
+  - saves updated model choices to the backend config file.
+  - new requests read the saved settings dynamically, so code does not need to be redeployed for model changes.
 
 ## 9. External libraries used in `kb-agent`
 

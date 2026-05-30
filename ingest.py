@@ -20,6 +20,7 @@ from qdrant_client import models
 
 from config import get_qdrant_client
 from env_loader import load_app_env
+from model_config import embedding_dimensions, model_for_step
 
 load_app_env()
 
@@ -34,8 +35,6 @@ DocType = Literal[
 ]
 ChunkType = Literal["body", "heading", "table", "key_value", "identity_field", "header", "footer"]
 
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536
 MIN_CHARS = 50
 OCR_DPI = 220
 DEFAULT_CHUNK_CHARS = 1800
@@ -581,13 +580,17 @@ def ensure_collection(name: str) -> None:
     except Exception:
         qc.create_collection(
             collection_name=name,
-            vectors_config=models.VectorParams(size=EMBED_DIM, distance=models.Distance.COSINE),
+            vectors_config=models.VectorParams(size=embedding_dimensions(), distance=models.Distance.COSINE),
         )
         print(f"Created collection: {name}")
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
-    resp = oai.embeddings.create(model=EMBED_MODEL, input=texts)
+    resp = oai.embeddings.create(
+        model=model_for_step("embedding_model"),
+        input=texts,
+        dimensions=embedding_dimensions(),
+    )
     return [item.embedding for item in resp.data]
 
 

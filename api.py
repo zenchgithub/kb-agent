@@ -22,6 +22,7 @@ from ingest import ingest
 from ingest_remote_dir import BASE_URL, ingest_remote_dir
 from config import cors_origins
 from document_links import document_name, document_url
+from model_config import public_model_config, save_model_config, model_for_step
 
 # Data validation for request bodies
 from pydantic import BaseModel
@@ -540,6 +541,25 @@ class QdrantDeleteSourceRequest(BaseModel):
     confirm: str | None = None
 
 
+class ModelConfigRequest(BaseModel):
+    planner_model: str
+    rerank_model: str
+    answer_model: str
+    embedding_model: str
+    embedding_dimensions: int = 1536
+
+
+@app.get("/admin/model-config")
+def admin_get_model_config(user=Depends(require_current_admin)):
+    return public_model_config()
+
+
+@app.put("/admin/model-config")
+def admin_update_model_config(body: ModelConfigRequest, user=Depends(require_current_admin)):
+    config = save_model_config(body.model_dump())
+    return public_model_config() | {"status": "ok", "config": config}
+
+
 @app.get("/admin/qdrant/collections/{collection}")
 def admin_qdrant_collection(collection: str, user=Depends(require_current_admin)):
     collection = validate_collection_name(collection)
@@ -815,7 +835,7 @@ def query_stream(
 
         # 6) Stream from OpenAI
         stream = oai.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model_for_step("answer_model"),
             messages=messages,
             stream=True,
         )

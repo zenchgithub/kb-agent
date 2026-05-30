@@ -377,6 +377,48 @@ This file documents the API endpoints implemented in `kb-agent/api.py`, includin
   { "status": "deleted", "collection": "nas_docs" }
   ```
 
+### `GET /admin/model-config`
+
+- Admin-only model pipeline configuration.
+- Returns the active models, production defaults, step descriptions, and model options used by the admin Settings UI.
+- Response shape:
+  ```json
+  {
+    "config": {
+      "planner_model": "gpt-5-mini",
+      "rerank_model": "gpt-5-mini",
+      "answer_model": "gpt-5-mini",
+      "embedding_model": "text-embedding-3-large",
+      "embedding_dimensions": 1536
+    },
+    "defaults": { "...": "..." },
+    "steps": { "...": { "label": "Planning", "description": "..." } },
+    "options": {
+      "chat": ["gpt-5-mini", "gpt-5.2", "gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"],
+      "embedding": ["text-embedding-3-large", "text-embedding-3-small"]
+    }
+  }
+  ```
+
+### `PUT /admin/model-config`
+
+- Admin-only update for the model pipeline.
+- New requests use the saved model choices without a code change.
+- Request body:
+  ```json
+  {
+    "planner_model": "gpt-5-mini",
+    "rerank_model": "gpt-5-mini",
+    "answer_model": "gpt-5-mini",
+    "embedding_model": "text-embedding-3-large",
+    "embedding_dimensions": 1536
+  }
+  ```
+- Response shape:
+  ```json
+  { "status": "ok", "config": { "...": "..." } }
+  ```
+
 ---
 
 ## `OPTIONS /{path}`

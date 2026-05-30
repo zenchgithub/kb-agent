@@ -6,6 +6,7 @@ from qdrant_client import models
 from config import get_qdrant_client
 from document_links import document_name, document_url
 from env_loader import load_app_env
+from model_config import embedding_dimensions, model_for_step
 
 class State(TypedDict, total=False):
     question: str            # original user question
@@ -66,7 +67,7 @@ Rules:
 - Do not invent names or identifiers not present in the question/history."""
 
     out = oai.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model_for_step("planner_model"),
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     ).choices[0].message.content
@@ -76,15 +77,10 @@ Rules:
     print(f"[plan] subqueries={plan_data.get('subqueries')} collections={plan_data.get('collections')} filters={plan_data.get('filters')}")
 
     new_state: State = dict(state)
-    new_state["subqueries"] = list(plan_data.get("subqueries") or [state["question"]])[:5]
+    subqueries, filters = enrich_plan_with_field_hints(state, plan_data)
+    new_state["subqueries"] = subqueries
     new_state["collections"] = list(plan_data.get("collections") or [])
-    filters = plan_data.get("filters") or {}
-    new_state["filters"] = {
-        "doc_type": list(filters.get("doc_type") or []),
-        "field_labels": list(filters.get("field_labels") or []),
-        "person_names": list(filters.get("person_names") or []),
-        "document_names": list(filters.get("document_names") or []),
-    }
+    new_state["filters"] = filters
     return new_state
 
 def require_user_id(state: State) -> str:
@@ -203,8 +199,95 @@ STOPWORDS = {
     "when", "where", "which", "who", "with", "would", "you",
 }
 
+FIELD_SYNONYMS = {
+    "attorney": [
+        "attorney",
+        "lawyer",
+        "representative",
+        "preparer",
+        "accredited representative",
+        "g 28",
+        "g-28",
+        "counsel",
+    ],
+    "nationality": ["nationality", "citizenship", "country of citizenship", "citizen", "ethopian", "ethiopian"],
+    "passport_number": ["passport number", "passport no", "passport no.", "document number"],
+    "date_of_birth": ["date of birth", "birth date", "dob"],
+    "date_of_issue": ["date of issue", "issued on", "issue date"],
+    "date_of_expiry": ["date of expiry", "expiration date", "expiry date", "expires"],
+    "address": ["address", "street", "city", "state", "zip"],
+    "employer": ["employer", "company", "occupation"],
+    "alien_number": ["alien number", "a-number", "a number", "uscis number"],
+}
+
+FIELD_CANONICAL = {
+    synonym: field
+    for field, synonyms in FIELD_SYNONYMS.items()
+    for synonym in synonyms
+}
+
 def normalize_search_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+def canonical_field_label(value: str) -> str:
+    normalized = normalize_search_text(value).replace(" ", "_")
+    for synonym, field in FIELD_CANONICAL.items():
+        if normalize_search_text(synonym).replace(" ", "_") == normalized:
+            return field
+    return normalized
+
+def detect_question_fields(question: str, filters: dict[str, list[str]] | None = None) -> list[str]:
+    haystack = normalize_search_text(question)
+    detected: list[str] = []
+    for raw in (filters or {}).get("field_labels", []) or []:
+        field = canonical_field_label(raw)
+        if field and field not in detected:
+            detected.append(field)
+    for field, synonyms in FIELD_SYNONYMS.items():
+        if any(normalize_search_text(synonym) in haystack for synonym in synonyms):
+            if field not in detected:
+                detected.append(field)
+    return detected
+
+def field_terms(fields: list[str]) -> list[str]:
+    terms: list[str] = []
+    for field in fields:
+        for synonym in FIELD_SYNONYMS.get(canonical_field_label(field), [field]):
+            normalized = normalize_search_text(synonym)
+            if normalized and normalized not in terms:
+                terms.append(normalized)
+    return terms
+
+def text_has_any_term(text: str, terms: list[str]) -> bool:
+    haystack = normalize_search_text(text)
+    return any(term and term in haystack for term in terms)
+
+def enrich_plan_with_field_hints(state: State, plan_data: dict) -> tuple[list[str], dict[str, list[str]]]:
+    filters = plan_data.get("filters") or {}
+    new_filters = {
+        "doc_type": list(filters.get("doc_type") or []),
+        "field_labels": [canonical_field_label(value) for value in list(filters.get("field_labels") or [])],
+        "person_names": list(filters.get("person_names") or []),
+        "document_names": list(filters.get("document_names") or []),
+    }
+    detected_fields = detect_question_fields(state["question"], new_filters)
+    for field in detected_fields:
+        if field not in new_filters["field_labels"]:
+            new_filters["field_labels"].append(field)
+
+    subqueries = list(plan_data.get("subqueries") or [state["question"]])[:5]
+    for field in detected_fields:
+        people = new_filters["person_names"] or []
+        if people:
+            for person in people[:2]:
+                q = f"{person} {' '.join(FIELD_SYNONYMS.get(field, [field])[:3])}"
+                if q not in subqueries:
+                    subqueries.append(q)
+        else:
+            q = " ".join(FIELD_SYNONYMS.get(field, [field])[:4])
+            if q not in subqueries:
+                subqueries.append(q)
+    return subqueries[:5], new_filters
 
 def source_label(raw_source: str) -> str:
     return unquote(Path(str(raw_source)).name).strip()
@@ -287,8 +370,11 @@ def keyword_match_chunks(
     filters: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     terms = significant_terms(question)
+    fields = detect_question_fields(question, filters)
+    field_term_list = field_terms(fields)
     if not terms:
-        return []
+        terms = field_term_list
+    query_persons = [normalize_search_text(value) for value in (filters or {}).get("person_names", [])]
 
     matches = []
     for collection in collections:
@@ -312,15 +398,57 @@ def keyword_match_chunks(
                     continue
 
                 text = str(payload.get("text") or "")
-                haystack = normalize_search_text(f"{source_label(raw_source)} {text}")
-                if all(term in haystack for term in terms):
-                    matches.append(payload_to_candidate(payload, score=1.2))
+                metadata_text = " ".join(
+                    str(payload.get(key) or "")
+                    for key in ("field_label", "person_name", "section", "heading", "doc_type", "chunk_type")
+                )
+                haystack = normalize_search_text(f"{source_label(raw_source)} {metadata_text} {text}")
+                field_hit = bool(field_term_list) and any(term in haystack for term in field_term_list)
+                all_terms_hit = bool(terms) and all(term in haystack for term in terms)
+                person_hit = not query_persons or any(person and person in haystack for person in query_persons)
+                if all_terms_hit or (field_hit and (person_hit or source_filter)):
+                    matches.append(payload_to_candidate(payload, score=1.8 if field_hit else 1.2))
                     if len(matches) >= KEYWORD_TOPK:
                         return matches
 
             if next_offset is None:
                 break
 
+    return matches
+
+def field_source_chunks(
+    collections: list[str],
+    source_matches: dict[str, list[str]],
+    user_id: str,
+    filters: dict[str, list[str]] | None = None,
+) -> list[dict]:
+    fields = detect_question_fields(" ".join((filters or {}).get("field_labels", [])), filters)
+    terms = field_terms(fields)
+    if not terms or not source_matches:
+        return []
+
+    matches: list[dict] = []
+    for collection, raw_sources in source_matches.items():
+        if not qdrant_collection_exists(collection):
+            continue
+        for raw_source in raw_sources:
+            points, _ = qc.scroll(
+                collection_name=collection,
+                scroll_filter=user_payload_filter(user_id, raw_source),
+                limit=512,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in points:
+                payload = point.payload or {}
+                text = " ".join(
+                    str(payload.get(key) or "")
+                    for key in ("source", "text", "field_label", "section", "heading", "keywords")
+                )
+                if text_has_any_term(text, terms):
+                    matches.append(payload_to_candidate(payload, score=2.0))
+                    if len(matches) >= KEYWORD_TOPK:
+                        return matches
     return matches
 
 async def one_search(
@@ -335,8 +463,9 @@ async def one_search(
 
     # embed the query
     vec = oai.embeddings.create(
-        model="text-embedding-3-small",
+        model=model_for_step("embedding_model"),
         input=query,
+        dimensions=embedding_dimensions(),
     ).data[0].embedding
 
     query_filter = retrieval_filter(user_id, raw_source, filters)
@@ -454,6 +583,7 @@ def retrieve(state: State) -> State:
     results = asyncio.run(retrieve_all(queries, collections, source_matches, user_id, filters))
 
     flat = structured_field_candidates(collections, user_id, filters)
+    flat.extend(field_source_chunks(collections, source_matches, user_id, filters))
     flat.extend(keyword_match_chunks(collections, state["question"], source_matches, user_id, filters))
     for hits in results:
         for p in hits:
@@ -506,6 +636,30 @@ def retrieve(state: State) -> State:
 def rerank(state: State) -> State:
     question = state["question"]
     candidates = state.get("candidates", [])
+    filters = state.get("filters", {})
+    question_fields = detect_question_fields(question, filters)
+    question_field_terms = field_terms(question_fields)
+    source_matches_present = any(
+        text_has_any_term(source_label(c.get("source", "")), [normalize_search_text(value)])
+        for c in candidates
+        for value in filters.get("document_names", [])
+    )
+    if question_field_terms:
+        field_candidates = [
+            c for c in candidates
+            if text_has_any_term(
+                " ".join(
+                    str(c.get(key) or "")
+                    for key in ("text", "field_label", "section", "heading", "keywords", "chunk_type")
+                ),
+                question_field_terms,
+            )
+        ]
+        if field_candidates:
+            candidates = field_candidates
+        elif source_matches_present:
+            candidates = []
+
     exact_candidates = [c for c in candidates if c.get("score", 0) >= 1.2]
     if exact_candidates:
         candidates = exact_candidates
@@ -552,7 +706,7 @@ Reranking rules:
 - For identity/legal questions, rank identity_field/key_value chunks first, then exact field+person chunks, then passport/id/visa chunks, then nearby narrative chunks."""
 
     out = oai.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model_for_step("rerank_model"),
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     ).choices[0].message.content
@@ -562,6 +716,17 @@ Reranking rules:
     idxs = data.get("ranked_indices", [])
 
     ranked = [candidates[i] for i in idxs if 0 <= i < len(candidates)]
+    if question_field_terms:
+        ranked = [
+            c for c in ranked
+            if text_has_any_term(
+                " ".join(
+                    str(c.get(key) or "")
+                    for key in ("text", "field_label", "section", "heading", "keywords", "chunk_type")
+                ),
+                question_field_terms,
+            )
+        ]
 
     new_state: State = dict(state)
     new_state["ranked"] = ranked
@@ -638,7 +803,7 @@ If the context does not clearly contain the answer, say:
 “I don’t have enough information in the retrieved documents.”"""
 
     resp = oai.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model_for_step("answer_model"),
         messages=[
             {"role": "system", "content": SYSPROMPT},
             {"role": "user", "content": prompt},
