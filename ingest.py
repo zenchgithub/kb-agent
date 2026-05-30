@@ -2,6 +2,9 @@ import sys
 import uuid
 import hashlib
 import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote
 from pypdf import PdfReader
@@ -18,6 +21,8 @@ _openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_ADMIN_KEY")
 if not _openai_key:
 	print("Missing OPENAI_API_KEY or OPENAI_ADMIN_KEY. Set it in .env or export it in your shell.")
 	sys.exit(1)
+if not shutil.which("tesseract"):
+	print("Warning: tesseract is not installed. Scanned/image-only PDFs will not be OCR-indexed.")
 
 oai = OpenAI(api_key=_openai_key)
 qc = get_qdrant_client()
@@ -49,6 +54,7 @@ OVERLAP = 100
 MIN_CHARS = 50
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIM = 1536
+OCR_DPI = 200
 
 
 def display_source(path: Path) -> str:
@@ -77,6 +83,42 @@ def chunk_text(text: str):
 		piece = " ".join(piece_words).strip()
 		if len(piece) > MIN_CHARS:
 			yield piece
+
+
+def ocr_pdf_page(pdf_path: Path, page_index: int) -> str:
+	"""OCR one PDF page by rendering it to an image and running Tesseract."""
+	if not shutil.which("tesseract"):
+		return ""
+
+	try:
+		import fitz  # PyMuPDF
+	except Exception as exc:
+		print(f"OCR skipped: PyMuPDF is unavailable ({exc})")
+		return ""
+
+	try:
+		doc = fitz.open(str(pdf_path))
+		try:
+			page = doc.load_page(page_index)
+			pix = page.get_pixmap(dpi=OCR_DPI, alpha=False)
+			with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as image_file:
+				pix.save(image_file.name)
+				result = subprocess.run(
+					["tesseract", image_file.name, "stdout", "--psm", "6"],
+					check=False,
+					capture_output=True,
+					text=True,
+					timeout=60,
+				)
+				if result.returncode != 0:
+					print(f"OCR failed on page {page_index + 1}: {result.stderr.strip()}")
+					return ""
+				return result.stdout.strip()
+		finally:
+			doc.close()
+	except Exception as exc:
+		print(f"OCR failed on page {page_index + 1}: {exc}")
+		return ""
 
 
 def extract(
@@ -119,6 +161,10 @@ def extract(
 	for i, page in enumerate(reader.pages, 1):
 		# extract_text() can return None; use empty string as fallback.
 		text = page.extract_text() or ""
+		if len(text.strip()) < MIN_CHARS:
+			ocr_text = ocr_pdf_page(path, i - 1)
+			if len(ocr_text.strip()) > len(text.strip()):
+				text = ocr_text
 
 		# Create chunks from the full page text.
 		page_chunks = list(chunk_text(text))
@@ -209,6 +255,7 @@ def ingest_to_qdrant(chunks_with_meta: list[dict], collection: str):
 		total_upserted += len(points)
 
 	print(f"✓ Ingested {total_upserted} chunks into '{collection}'")
+	return total_upserted
 
 
 def ingest(
@@ -227,8 +274,8 @@ def ingest(
 	)
 	if not chunks_with_meta:
 		print("No chunks to ingest.")
-		return
-	ingest_to_qdrant(chunks_with_meta, collection)
+		return 0
+	return ingest_to_qdrant(chunks_with_meta, collection)
 
 
 if __name__ == "__main__":

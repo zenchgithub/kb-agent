@@ -9,6 +9,7 @@ python-jose[cryptography]
 qdrant-client
 python-dotenv
 pypdf
+PyMuPDF
 pyyaml
 requests
 sqlalchemy

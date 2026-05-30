@@ -466,13 +466,33 @@ async def upload_document(
     local_path.write_bytes(content)
     try:
         is_public = x_is_public.strip().lower() in {"1", "true", "yes", "public"}
-        ingest(
+        indexed_chunks = ingest(
             str(local_path),
             x_collection,
             user_id=current_user["id"],
             is_public=is_public,
             indexed_by_email=current_user.get("email"),
         )
+        if indexed_chunks <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Uploaded to NAS, but no searchable text chunks were extracted. "
+                    "This PDF may be scanned or image-only, so it was not indexed in Qdrant."
+                ),
+            )
+        print(
+            "[upload-document] indexed",
+            {
+                "filename": filename,
+                "collection": x_collection,
+                "chunks": indexed_chunks,
+                "isPublic": is_public,
+                "user_id": current_user["id"],
+            },
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Uploaded to NAS but ingest failed: {exc}") from exc
 
@@ -480,6 +500,7 @@ async def upload_document(
         "status": "ok",
         "document_name": filename,
         "collection": x_collection,
+        "chunks_indexed": indexed_chunks,
         "isPublic": is_public,
         "indexed_by_email": current_user.get("email"),
         "source": document_url(filename),
